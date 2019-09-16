@@ -1,0 +1,439 @@
+//  main.cpp
+//  Sensorproject
+// This is the code written by Jocelyn Lo, Samantha Kobes, and Grace Liu
+// This program is designed to potentially be used as a number tracker to count the number of object/people that entered and exited any certain setting such as stores and transportation systems
+// The program keep track the number of objects that came in and out of an opening of a circuit by keeping track of number of times that the each two lasers were broken under the consideration of mutiple cases
+#include "gpiolib_addr.h"
+#include "gpiolib_reg.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <fcntl.h>
+#include <linux/watchdog.h>     //needed for the watchdog specific constants
+#include <time.h>
+#include "gpiolib_reg.c"
+#include <signal.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/ioctl.h>         //needed for the ioctl function
+#include <sys/time.h>           //for gettimeofday()
+
+
+#define PRINT_MSG(file, time, programName, str) \
+do{ \
+fprintf(logFile, "%s : %s : %s", time, programName, str); \
+fflush(logFile); \
+}while(0)
+
+enum laserStatus { ERROR=-1, START, UNBROKEN, ONE_BROKEN, TWO_BROKEN, BOTH_BROKEN};
+
+#ifndef MARMOSET_TESTING
+
+GPIO_Handle initializeGPIO(){
+    
+    GPIO_Handle gpio;
+    gpio = gpiolib_init_gpio();
+    if(gpio == NULL){
+        perror("Could not initialize GPIO");
+    }
+    return gpio;
+}
+
+#define LASER1_PIN_NUM 4
+#define LASER2_PIN_NUM 5
+
+int laserDiodeStatus(GPIO_Handle gpio, int diodeNumber){
+    if(gpio == NULL){
+        return -1;
+    }
+    if(diodeNumber == 1){
+        uint32_t level_reg = gpiolib_read_reg(gpio, GPLEV(0));
+        
+        if(level_reg & (1 << LASER1_PIN_NUM)){
+            return 1;
+        }
+        else{
+            return 0;
+        }
+    }else if(diodeNumber == 2){
+        uint32_t level_reg = gpiolib_read_reg(gpio, GPLEV(0));
+        
+        if(level_reg & (1 << LASER2_PIN_NUM)){
+            return 1;
+        }
+        else{
+            return 0;
+        }
+    }
+    else{
+        return -1;
+    }
+}
+#endif
+
+void errorMessage(int errorCode){
+    
+    fprintf(stderr, "An error occured; the error code was %d \n", errorCode);
+}
+
+enum laserStatus currentInput(GPIO_Handle gpio){
+    
+    if(gpio==NULL)
+        return ERROR;
+    
+    
+    int one = laserDiodeStatus(gpio, 1);
+    int two = laserDiodeStatus(gpio, 2);
+    
+    
+    if(one==1&&two==1)
+        return UNBROKEN;
+    else if(one==1&&two==0)
+        return TWO_BROKEN;
+    else if(two==1&&one==0)
+        return ONE_BROKEN;
+    else if(one==0&&two==0)
+        return BOTH_BROKEN;
+    else
+        return ERROR;
+}
+
+void readConfig(FILE* configFile, int* timeout, char* logFileName)
+{
+    int i = 0;
+    
+    char buffer[255];
+    
+    *timeout = 0;
+    
+    int input = 0;
+    
+    
+    while(fgets(buffer, 255, configFile) != NULL)
+    {
+        i = 0;
+        //If the starting character of the string is a '#',
+        //then we can ignore that line
+        if(buffer[i] != '#')
+        {
+            while(buffer[i] != 0)
+            {
+                //This if will check the value of timeout
+                if(buffer[i] == '=' && input == 0)
+                {
+                    //The loop runs while the character is not null
+                    while(buffer[i] != 0)
+                    {
+                        //If the character is a number from 0 to 9
+                        if(buffer[i] >= '0' && buffer[i] <= '9')
+                        {
+                            //Move the previous digits up one position and add the
+                            //new digit
+                            *timeout = (*timeout *10) + (buffer[i] - '0');
+                        }
+                        i++;
+                    }
+                    input++;
+                }
+                else if(buffer[i] == '=' && input == 1) //This will find the name of the log file
+                {
+                    int j = 0;
+                    //Loop runs while the character is not a newline or null
+                    while(buffer[i] != 0  && buffer[i] != '\n')
+                    {
+                        //If the characters after the equal sign are not spaces or
+                        //equal signs, then it will add that character to the string
+                        if(buffer[i] != ' ' && buffer[i] != '=')
+                        {
+                            logFileName[j] = buffer[i];
+                            j++;
+                        }
+                        i++;
+                    }
+                    //Add a null terminator at the end
+                    logFileName[j] = 0;
+                    input++;
+                }
+                
+                else
+                {
+                    i++;
+                }
+            }
+        }
+    }
+}
+
+void getTime(char* buffer)
+{
+    //Create a timeval struct named tv
+    struct timeval tv;
+    
+    //Create a time_t variable named curtime
+    time_t curtime;
+    
+    
+    //Get the current time and store it in the tv struct
+    gettimeofday(&tv, NULL);
+    
+    //Set curtime to be equal to the number of seconds in tv
+    curtime=tv.tv_sec;
+    
+    strftime(buffer,30,"%m-%d-%Y  %T.",localtime(&curtime));
+    
+}
+
+int main(const int argc, const char* const argv[]){
+    
+    //Create a string that contains the program name
+    const char* argName = argv[0];
+    
+    
+    int i = 0;
+    int namelength = 0;
+    
+    while(argName[i] != 0)
+    {
+        namelength++;
+        i++;
+    }
+    
+    char programName[namelength];
+    
+    i = 0;
+    
+    //Copy the name of the program without the ./ at the start
+    //of argv[0]
+    while(argName[i + 2] != 0)
+    {
+        programName[i] = argName[i + 2];
+        i++;
+    }
+    
+    //Create a file pointer named configFile
+    FILE* configFile;
+    //Set configFile to point to the Lab4Sample.cfg file. It is
+    //set to read the file.
+    configFile = fopen("/home/pi/watchdoggy.cfg", "r");
+    
+    //Output a warning message if the file cannot be openned
+    if(!configFile)
+    {
+        perror("The config file could not be opened");
+        return -1;
+    }
+    
+    //Declare the variables that will be passed to the readConfig function
+    int timeout;
+    char logFileName[50];
+    
+    //Call the readConfig function to read from the config file
+    readConfig(configFile, &timeout, logFileName);
+    
+    //Close the configFile now that we have finished reading from it
+    fclose(configFile);
+    
+    //Create a new file pointer to point to the log file
+    FILE* logFile;
+    //Set it to point to the file from the config file and make it append to
+    //the file when it writes to it.
+    logFile = fopen(logFileName, "a");
+    
+    //Check that the file opens properly.
+    if(!logFile)
+    {
+        perror("The log file could not be opened");
+        return -1;
+    }
+    
+    //Create a char array that will be used to hold the time values
+    char timer[30];
+    getTime(timer);
+    
+    printf("Started\n");
+    
+    GPIO_Handle gpio = initializeGPIO();
+    if(gpio==NULL)
+        return -1;
+    
+    getTime(timer);
+    PRINT_MSG(logFile, timer, programName, "The GPIO pins have been initialized\n\n");
+    
+    int watchdog;
+    
+    if ((watchdog = open("/dev/watchdog", O_RDWR | O_NOCTTY)) < 0) {
+        printf("Error: Couldn't open watchdog device! %d\n", watchdog);
+        return -1;
+    }
+    //Get the current time
+    getTime(timer);
+    //Log that the watchdog file has been opened
+    PRINT_MSG(logFile, timer, programName, "The Watchdog file has been opened\n\n");
+    
+    ioctl(watchdog, WDIOC_SETTIMEOUT, &timeout);
+    
+    getTime(timer);
+    
+    PRINT_MSG(logFile, timer, programName, "The Watchdog time limit has been set\n\n");
+    
+    
+    ioctl(watchdog, WDIOC_GETTIMEOUT, &timeout);
+    
+    printf("The watchdog timeout is %d seconds.\n\n", timeout);
+    
+    //Declaring the switch case variable.
+    enum laserStatus s = START;
+    
+    //Declaring Variables
+    int movedIn = 0;
+    int movedOut = 0;
+    int laserOne = 0;
+    int laserTwo = 0;
+    
+    //Entering variable to be used to determine if an object is entering or leaving.
+    int entering = 0;
+    
+    while(1){
+        
+        ioctl(watchdog, WDIOC_KEEPALIVE, &timeout);
+        switch(s){
+                
+            case START:
+                
+                s = currentInput(gpio);
+                
+                if(s!=UNBROKEN){
+                    errorMessage(1);
+                    s=ERROR;
+                }
+                
+                break;
+                
+            case UNBROKEN:
+                
+                s = currentInput(gpio);
+                
+                
+                if(s==BOTH_BROKEN){
+                    
+                    errorMessage(4);
+                    s=ERROR;
+                }else if(s==ONE_BROKEN){
+                    laserOne++;
+                    getTime(timer);
+                    
+                    PRINT_MSG(logFile, timer, programName, "The Left Laser is broken\n\n");
+                    entering = 1;
+                }else if(s==TWO_BROKEN){
+                    laserTwo++;
+                    getTime(timer);
+                    
+                    PRINT_MSG(logFile, timer, programName, "The Right Laser is broken\n\n");
+                    entering = 2;
+                }
+                
+                break;
+                
+            case ONE_BROKEN:
+                
+                s = currentInput(gpio);
+                
+                
+                if(s==BOTH_BROKEN){
+                    laserTwo++;
+                    getTime(timer);
+                    PRINT_MSG(logFile, timer, programName, "The Right Laser is broken\n\n");
+                }else if(s==TWO_BROKEN){
+                    
+                    errorMessage(5);
+                    s = ERROR;
+                }else if(s==UNBROKEN){
+                    if(entering == 2){
+                        movedOut++;
+                        getTime(timer);
+                        PRINT_MSG(logFile, timer, programName, "The Object Exited The Room\n\n");
+                    }
+                    entering = 0;
+                }
+                
+                break;
+                
+            case TWO_BROKEN:
+                
+                s = currentInput(gpio);
+                
+                if(s==BOTH_BROKEN){
+                    laserOne++;
+                    getTime(timer);
+                    PRINT_MSG(logFile, timer, programName, "The Left Laser is broken\n\n");
+                }else if(s==ONE_BROKEN){
+                    
+                    errorMessage(2);
+                    s=ERROR;
+                }else if(s==UNBROKEN){
+                    if(entering == 1){
+                        movedIn++;
+                        getTime(timer);
+                        PRINT_MSG(logFile, timer, programName, "The Object Entered The Room\n\n");
+                    }
+                    entering = 0;
+                }
+                
+                break;
+                
+            case BOTH_BROKEN:
+                
+                s = currentInput(gpio);
+                
+                
+                if(s==UNBROKEN){
+                    
+                    errorMessage(3);
+                    s=ERROR;
+                }
+                
+                break;
+                
+            case ERROR:
+                
+                return -1;
+                
+                break;
+                
+            default:
+                
+                errorMessage(0);
+                return -1;
+                
+                break;
+        }
+        
+        sleep(200);
+        
+        ioctl(watchdog, WDIOC_KEEPALIVE, 0);
+        getTime(timer);
+        
+        PRINT_MSG(logFile, timer, programName, "The Watchdog was kicked\n\n");
+        
+    }
+    
+    write(watchdog, "V", 1);
+    getTime(timer);
+    //Log that the Watchdog was disabled
+    PRINT_MSG(logFile, timer, programName, "The Watchdog was disabled\n\n");
+    
+    //Close the watchdog file so that it is not accidentally tampered with
+    close(watchdog);
+    getTime(timer);
+    //Log that the Watchdog was closed
+    PRINT_MSG(logFile, timer, programName, "The Watchdog was closed\n\n");
+    
+    //Free the GPIO now that the program is over.
+    gpiolib_free_gpio(gpio);
+    getTime(timer);
+    //Log that the GPIO pins were freed
+    PRINT_MSG(logFile, timer, programName, "The GPIO pins have been freed\n\n");
+    
+    //End return statement.
+    return 0;
+}
